@@ -1,0 +1,234 @@
+name: "Monitor VCS-Backed Terraform Run"
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: 'Optional: Specific TFC Run ID to monitor'
+        required: false
+        type: string
+
+env:
+  TF_CLOUD_ORGANIZATION: ${{ vars.TF_CLOUD_ORGANIZATION }}
+  TF_API_TOKEN: ${{ secrets.TF_API_TOKEN }}
+  TF_WORKSPACE: ${{ vars.TF_WORKSPACE }}
+
+jobs:
+  monitor-run:
+    name: "Monitor Terraform Cloud Run"
+    runs-on: ubuntu-latest
+
+    outputs:
+      run_id: ${{ steps.find-run.outputs.run_id }}
+      run_status: ${{ steps.wait-apply.outputs.final_status }}
+      run_link: ${{ steps.find-run.outputs.run_link }}
+
+    steps:
+      - name: Find Latest Run
+        id: find-run
+        run: |
+          echo "🔍 Finding latest run for VCS-backed workspace..."
+          echo ""
+
+          tfc_api_call() {
+            curl -s \
+              --header "Authorization: Bearer ${{ env.TF_API_TOKEN }}" \
+              --header "Content-Type: application/vnd.api+json" \
+              "https://app.terraform.io/api/v2$1"
+          }
+
+          # Check if specific run_id was provided
+          if [ -n "${{ github.event.inputs.run_id }}" ]; then
+            RUN_ID="${{ github.event.inputs.run_id }}"
+            echo "📝 Using provided run ID: $RUN_ID"
+          else
+            # Get workspace ID first
+            WORKSPACE_DATA=$(tfc_api_call "/organizations/${{ env.TF_CLOUD_ORGANIZATION }}/workspaces/${{ env.TF_WORKSPACE }}")
+            WORKSPACE_ID=$(echo "$WORKSPACE_DATA" | jq -r '.data.id')
+
+            echo "Workspace ID: $WORKSPACE_ID"
+            echo ""
+
+            # Get the most recent run for this workspace
+            # Filter by VCS trigger and get the first (most recent) run
+            RUNS_DATA=$(tfc_api_call "/workspaces/$WORKSPACE_ID/runs?page%5Bsize%5D=5")
+
+            # Get the most recent run
+            RUN_ID=$(echo "$RUNS_DATA" | jq -r '.data[0].id')
+            RUN_STATUS=$(echo "$RUNS_DATA" | jq -r '.data[0].attributes.status')
+            RUN_MESSAGE=$(echo "$RUNS_DATA" | jq -r '.data[0].attributes.message')
+
+            echo "📋 Latest Run Details:"
+            echo "   Run ID: $RUN_ID"
+            echo "   Status: $RUN_STATUS"
+            echo "   Message: $RUN_MESSAGE"
+            echo ""
+
+            # Verify this is a recent run (not an old completed one)
+            if [[ "$RUN_STATUS" == "applied" ]] || [[ "$RUN_STATUS" == "discarded" ]] || [[ "$RUN_STATUS" == "canceled" ]]; then
+              echo "⚠️  Most recent run is already in terminal state: $RUN_STATUS"
+              echo "This likely means:"
+              echo "  - The VCS webhook triggered a run that has already completed"
+              echo "  - Or you're running this workflow on an already-processed commit"
+              echo ""
+              echo "Continuing to monitor anyway..."
+            fi
+          fi
+
+          if [[ -z "$RUN_ID" || "$RUN_ID" == "null" ]]; then
+            echo "::error::No run found for workspace"
+            exit 1
+          fi
+
+          echo "run_id=$RUN_ID" >> $GITHUB_OUTPUT
+          echo "run_link=https://app.terraform.io/app/${{ env.TF_CLOUD_ORGANIZATION }}/workspaces/${{ env.TF_WORKSPACE }}/runs/$RUN_ID" >> $GITHUB_OUTPUT
+
+      - name: Wait for Apply Completion
+        id: wait-apply
+        timeout-minutes: 60
+        run: |
+          echo "⏳ Monitoring run until apply completes..."
+          echo "🔗 View run: ${{ steps.find-run.outputs.run_link }}"
+          echo ""
+
+          tfc_api_call() {
+            curl -s \
+              --header "Authorization: Bearer ${{ env.TF_API_TOKEN }}" \
+              --header "Content-Type: application/vnd.api+json" \
+              "https://app.terraform.io/api/v2$1"
+          }
+
+          MAX_WAIT=3600  # 60 minutes
+          ELAPSED=0
+          CHECK_INTERVAL=30  # Check every 30 seconds
+
+          while [ $ELAPSED -lt $MAX_WAIT ]; do
+            RUN_DATA=$(tfc_api_call "/runs/${{ steps.find-run.outputs.run_id }}")
+            CURRENT_STATUS=$(echo "$RUN_DATA" | jq -r '.data.attributes.status')
+
+            echo "[$(date +%H:%M:%S)] Current status: $CURRENT_STATUS"
+
+            # Check for terminal states
+            case $CURRENT_STATUS in
+              applied)
+                echo ""
+                echo "✅ Apply completed successfully!"
+                echo "final_status=applied" >> $GITHUB_OUTPUT
+                exit 0
+                ;;
+              planned_and_finished)
+                echo ""
+                echo "✅ Plan completed (no changes to apply)"
+                echo "final_status=planned_and_finished" >> $GITHUB_OUTPUT
+                exit 0
+                ;;
+              errored)
+                echo ""
+                echo "::error::❌ Run failed with error"
+                echo "final_status=errored" >> $GITHUB_OUTPUT
+                exit 1
+                ;;
+              discarded)
+                echo ""
+                echo "::warning::⚠️  Run was discarded"
+                echo "final_status=discarded" >> $GITHUB_OUTPUT
+                exit 1
+                ;;
+              canceled)
+                echo ""
+                echo "::warning::⚠️  Run was canceled"
+                echo "final_status=canceled" >> $GITHUB_OUTPUT
+                exit 1
+                ;;
+              post_plan_awaiting_decision)
+                echo "   ⏸️  Run is awaiting policy override or manual confirmation"
+                ;;
+              planning|plan_queued|applying|apply_queued|confirmed)
+                echo "   ⏳ Run in progress..."
+                ;;
+              *)
+                echo "   ℹ️  Status: $CURRENT_STATUS"
+                ;;
+            esac
+
+            sleep $CHECK_INTERVAL
+            ELAPSED=$((ELAPSED + CHECK_INTERVAL))
+          done
+
+          echo ""
+          echo "::error::❌ Timeout waiting for run to complete after $MAX_WAIT seconds"
+          echo "final_status=timeout" >> $GITHUB_OUTPUT
+          exit 1
+
+      - name: Generate Summary
+        if: always()
+        run: |
+          echo "# 🔍 VCS-Backed Workspace Monitor" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          echo "### 📊 Run Details" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Attribute | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Workspace** | \`${{ env.TF_WORKSPACE }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Run ID** | \`${{ steps.find-run.outputs.run_id }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Final Status** | \`${{ steps.wait-apply.outputs.final_status }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Trigger** | ${{ github.event_name }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          echo "### 🔗 Links" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- [View Run in TFC](${{ steps.find-run.outputs.run_link }})" >> $GITHUB_STEP_SUMMARY
+          echo "- [Workspace: ${{ env.TF_WORKSPACE }}](https://app.terraform.io/app/${{ env.TF_CLOUD_ORGANIZATION }}/workspaces/${{ env.TF_WORKSPACE }})" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "*VCS-backed workspace monitoring | Commit: \`${GITHUB_SHA:0:7}\`*" >> $GITHUB_STEP_SUMMARY
+
+  post-apply-actions:
+    name: "Post-Apply CI/CD Actions"
+    runs-on: ubuntu-latest
+    needs: monitor-run
+    if: needs.monitor-run.outputs.run_status == 'applied' || needs.monitor-run.outputs.run_status == 'planned_and_finished'
+
+    steps:
+      - name: Hello World - Post-Apply Step
+        run: |
+          echo "🎉 Hello World! Terraform apply has completed successfully."
+          echo ""
+          echo "This is where you would run additional CI/CD processes:"
+          echo "  • Run integration tests against deployed infrastructure"
+          echo "  • Deploy applications to newly provisioned resources"
+          echo "  • Update service catalog or CMDB"
+          echo "  • Send notifications to Slack/Teams"
+          echo "  • Trigger downstream pipelines"
+          echo "  • Update documentation"
+          echo ""
+          echo "Run ID: ${{ needs.monitor-run.outputs.run_id }}"
+          echo "Run Link: ${{ needs.monitor-run.outputs.run_link }}"
+
+      - name: Example - Integration Test Placeholder
+        run: |
+          echo "🧪 Running integration tests..."
+          echo "✅ Integration tests passed!"
+
+      - name: Example - Notification Placeholder
+        run: |
+          echo "📢 Sending success notification..."
+          echo "✅ Notification sent!"
+
+      - name: Post-Apply Summary
+        run: |
+          echo "# ✅ Post-Apply Actions Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Terraform apply completed successfully and all post-apply CI/CD steps have executed." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Next Steps:**" >> $GITHUB_STEP_SUMMARY
+          echo "- Integration tests: ✅ Passed" >> $GITHUB_STEP_SUMMARY
+          echo "- Notifications: ✅ Sent" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Run Details:**" >> $GITHUB_STEP_SUMMARY
+          echo "- [View Run in TFC](${{ needs.monitor-run.outputs.run_link }})" >> $GITHUB_STEP_SUMMARY
