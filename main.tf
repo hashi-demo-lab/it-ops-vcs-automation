@@ -41,9 +41,9 @@ resource "random_id" "example_id" {
   byte_length = 4
 }
 
-output "example_id" {
-  description = "The generated random ID"
-  value       = random_id.example_id.hex
-} 
+#output "example_id" {
+#  description = "The generated random ID"
+#  value       = random_id.example_id.hex
+#} 
 
 #
